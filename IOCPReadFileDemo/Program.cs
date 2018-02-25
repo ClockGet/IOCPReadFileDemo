@@ -1,4 +1,5 @@
-﻿using Microsoft.Win32.SafeHandles;
+﻿#define MANUAL_BIND_IOCP
+using Microsoft.Win32.SafeHandles;
 using Node.Utilities.Native;
 using System;
 using System.Diagnostics;
@@ -30,17 +31,57 @@ namespace IOCPReadFileDemo
            uint dwFlagsAndAttributes,
 
            SafeFileHandle hTemplateFile);
+#if MANUAL_BIND_IOCP
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern SafeFileHandle CreateIoCompletionPort(
+                  IntPtr fileHandle, IntPtr existingCompletionPort, UIntPtr completionKey, UInt32 numberOfConcurrentThreads);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern Boolean GetQueuedCompletionStatus(
+                IntPtr completionPort, out UInt32 lpNumberOfBytes, out IntPtr lpCompletionKey, out IntPtr lpOverlapped, UInt32 dwMilliseconds);
+        private static UInt32 INFINITE_TIMEOUT = unchecked((UInt32)Timeout.Infinite);
+        private static IntPtr INVALID_FILE_HANDLE = unchecked((IntPtr)(-1));
+        private static IntPtr INVALID_IOCP_HANDLE = IntPtr.Zero;
+#endif
         static unsafe void Main(string[] args)
         {
             var safeFileHandle = CreateFile(@"C:\Windows\win.ini", Win32Api.GENERIC_READ, Win32Api.FILE_SHARE_READ, (IntPtr)null, Win32Api.OPEN_EXISTING, Win32Api.FILE_FLAG_OVERLAPPED, new SafeFileHandle(IntPtr.Zero, false));
+#if MANUAL_BIND_IOCP
+            SafeFileHandle iocpHandle = CreateIoCompletionPort(INVALID_FILE_HANDLE, INVALID_IOCP_HANDLE, UIntPtr.Zero, 0);
+            CreateIoCompletionPort(safeFileHandle.DangerousGetHandle(), iocpHandle.DangerousGetHandle(), UIntPtr.Zero, 0);
+            int threadCount = Environment.ProcessorCount * 2;
+            for (int i = 0; i < threadCount; i++)
+            {
+                new Thread(() =>
+                {
+                    try
+                    {
+                        UInt32 lpNumberOfBytes;
+                        IntPtr lpCompletionKey, lpOverlapped;
+                        while (GetQueuedCompletionStatus(iocpHandle.DangerousGetHandle(), out lpNumberOfBytes, out lpCompletionKey, out lpOverlapped, INFINITE_TIMEOUT))
+                        {
+                            NativeOverlapped* native = (NativeOverlapped*)lpOverlapped;
+                            //推入到IO线程的任务队列
+                            ThreadPool.UnsafeQueueNativeOverlapped(native);
+                        }
+                    }
+                    finally
+                    {
+
+                    }
+                })
+                { IsBackground = true }.Start();
+            }
+#else
             ThreadPool.BindHandle(safeFileHandle);
-            byte[] buffer = new byte[1024];
+#endif
+            byte[] buffer = new byte[16384];
             AsyncResult ar = new AsyncResult(buffer);
             NativeOverlapped* nativeOverlapped = new Overlapped(0, 0, IntPtr.Zero, ar).Pack(ReadCompletionCallback, buffer);
 
             fixed (byte* pBuf = buffer)
             {
-                ReadFile(safeFileHandle, pBuf, 1024, IntPtr.Zero, nativeOverlapped);
+                ReadFile(safeFileHandle, pBuf, 16384, IntPtr.Zero, nativeOverlapped);
             }
             int workerNums, ioNums;
             ThreadPool.GetAvailableThreads(out workerNums, out ioNums);
@@ -61,6 +102,9 @@ namespace IOCPReadFileDemo
                     ThreadPool.GetAvailableThreads(out workerNums, out ioNums);
                     Console.WriteLine("from callback thread: available work threads:{0}, io threads:{1}", workerNums, ioNums);
 
+#if MANUAL_BIND_IOCP
+                    numBytes = (uint)(nativeOverlapped->InternalHigh);
+#endif
                     Overlapped overlapped = Overlapped.Unpack(nativeOverlapped);
                     var ar = (AsyncResult)overlapped.AsyncResult;
                     var buffer = (byte[])ar.AsyncState;
